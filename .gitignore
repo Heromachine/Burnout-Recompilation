@@ -1,0 +1,70 @@
+# Nothing game-derived may enter git history.
+#
+# The game's code and assets are copyrighted, and anything produced by feeding
+# them through the recompiler is a derivative of them. Only original work --
+# the scaffold, tools, configuration, reports and build files -- belongs here.
+# A game-derived file committed once has to be purged from history, not just
+# the working tree, so keep it out in the first place.
+
+# Extracted contents of the user's own disc image.
+game_files/
+
+# Lifted from the game by tools.recomp: derivative, regenerable with
+# ./regenerate.sh from the user's own copy.
+src/recomp/gen/
+
+# Pipeline intermediates (disasm/func_id/abi_analysis output). These are
+# game-derived and fully reproducible; they are deliberately kept inside this
+# workspace rather than in /mnt/dev/xboxrecomp-fork so a run leaves the shared
+# toolchain worktree untouched.
+build/
+
+# Build output, including the compiled game code.
+build-*/
+*.exe
+*.dll
+*.a
+*.o
+*.obj
+
+# Runtime artefacts from a debug run.
+*.log
+backtrace*.txt
+icall_targets.dump
+
+# Frame dumps: game-derived rendered output.
+framedump_*.ppm
+
+# CodeGraph's local index.
+.codegraph/
+
+# Research: the WRITTEN work is tracked (research/reports, research/README.md),
+# because that is original analysis. The evidence it cites is not, because it
+# is game-derived:
+#
+#   research/artifacts/  a copy of default.xbe, sampled .dff/.dds/.raw/.dat/
+#                        .cfg disc files, dsstdfx.bin, and bulk string dumps
+#                        pulled out of the executable -- all verbatim game
+#                        content or direct extractions of it;
+#   research/captures/   screenshots of the running game;
+#   research/xemu-profile/  machine-local emulator state.
+#
+# These stay durable on disk and HeroLab records their exact paths and the
+# commands that recreate them; they just never enter git history, where a
+# mistake cannot be undone by deleting the file.
+# Note the trailing /* rather than /: git does not descend into an excluded
+# directory, so a negation below it would never be reached.
+research/artifacts/*
+research/captures/
+research/xemu-profile/
+
+# Exception: tool-generated measurements about the executable (function counts
+# per section, import call counts). Our own output, no game content.
+!research/artifacts/phase1/
+
+# Python bytecode.
+__pycache__/
+*.pyc
+
+# The Windows launcher's build output (launcher-win/build.sh).
+launcher-win/out/

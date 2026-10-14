@@ -1,0 +1,50 @@
+{
+  "schema": "burnout-source-manifest/1",
+  "description": "Pinned identities for the Burnout Xbox recompilation. tools/verify-inputs.sh checks the live files against this file; nothing in the pipeline may run against unverified inputs.",
+  "generated": "2026-09-20",
+  "phase_recorded": 1,
+  "source_media": {
+    "path": "/mnt/tank-1/roms/xbox/ISO/Burnout.iso",
+    "access": "read-only; never copied into version control",
+    "size_bytes": 1468268544,
+    "sha256": "a43cf4a91e1bb96f4d85d44d8610fbf4ecdbb90047e578d4ca030daf1cbe9c9d"
+  },
+  "executable": {
+    "extracted_path": "game_files/default.xbe",
+    "disc_name": "default.xbe",
+    "size_bytes": 1986560,
+    "sha256": "42bd7d38feb39c17783197c4433435bfc06d8f5872d6f4b45048d9daac82013b",
+    "title": "Burnout",
+    "title_id": "0x41430006",
+    "type": "retail",
+    "region_media": "North America / DVD_X2",
+    "xdk_version": "1.0.4361",
+    "base_address": "0x00010000",
+    "image_size": "0x008B7140",
+    "entry_point": "0x000160FF",
+    "kernel_thunk_addr": "0x0017C960"
+  },
+  "toolchain": {
+    "xboxrecomp": {
+      "path": "/mnt/dev/xboxrecomp-fork",
+      "commit": "d2a99345c560c46304b09883d50be9b6d8ae3179",
+      "branch": "main",
+      "python": ".venv/bin/python",
+      "note": "Seeding requires commit c70542c or newer. Pinned to d2a9934 on main (2026-10-14): 7602903 + daa4900 frame pointer for frameless (fpo_leaf) functions and SEH callers, d2a9934 fxam; fixes the race-start crash and then the invisible racing cars on HeroGame (HeroLab e2c5e948, upstream ledger fd715465). Before that f52f6c3 on main (2026-10-13): burnout/async-perf merged (4e90527 KeTickCount thread + movable kernel VAs, aac6317 downmix, a8ee8fd vertex fast path, be42873 async PFIFO, 7b5fde6 GPU/APU ISR wakes, 1f86f07 texture cache, 90381c0 bulk decode, 74abb07 indexed draws, 25aa446 clear-value mirror, 16b002f XBOXRECOMP_GUEST_KEVENTS per-title switch, on for Burnout in CMakeLists) and burnout/res-scale (3ace187 XBOXRECOMP_RES_SCALE, f52f6c3 discrete-GPU exports). HeroLab 7b9e050b. Before that 19a645b (logical flags), 2aa8c96 (fixed-function pipeline), 4b362fc (0cc57b6 2D mapping, swizzled 0x06/0x19). Earlier: c6cad72 (2026-10-07) rebaselined on 18a20e2 (HeroLab f31e831d). AllowedMediaTypes is relaxed at load since 42c4b8c (XBOXRECOMP_MEDIA_PATCH=0 restores the retail disc check). See HeroLab tasks 875a0ee7 and df74a7c7."
+    },
+    "xemu": {
+      "path": "/mnt/dev/xemu-fork",
+      "commit": "9320c303371006106a24820167005a75b3eaee11",
+      "tested_binary": "0.8.136-30-gd73326b621",
+      "tested_binary_commit": "d73326b62199c6dd952ef512947710e1333a49d3",
+      "role": "ground truth"
+    },
+    "regression_control": {
+      "name": "Breakdown",
+      "path": "/mnt/dev/Breakdown-Launcher",
+      "commit": "7bc758bbec97986a0ae76b0d071c9985d9e5d5f9",
+      "branch": "gpu-presentation",
+      "role": "standing Xbox regression control for any shared xboxrecomp change"
+    }
+  }
+}

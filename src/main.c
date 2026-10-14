@@ -1,0 +1,1005 @@
+/**
+ * Burnout - Recompiled Game Entry Point
+ *
+ * This is the Windows executable that hosts the recompiled game code.
+ * It performs the following initialization sequence:
+ *
+ * 1. Load the original XBE file from disk
+ * 2. Initialize the Xbox memory layout (map data sections to original VAs)
+ * 3. Initialize the Xbox kernel replacement layer
+ * 4. Initialize the kernel bridge (thunk table in Xbox memory)
+ * 5. Set up game file paths for I/O redirection
+ * 6. Initialize the stack pointer
+ * 7. Install VEH crash handler for diagnostics
+ * 8. Call the game's original entry point (recompiled)
+ *
+ * Filled in for Burnout. Still open, and deliberately left as the template
+ * wrote them rather than guessed at:
+ *   - CRT global pre-initialization, if Burnout's CRT needs it (see the
+ *     __active_heap note in WinMain);
+ *   - game-specific VEH diagnostics, once a crash gives a reason to add one.
+ *
+ * XBE Details (from tools.xbe_parser; see config/source-manifest.json):
+ *   Title:       Burnout (Criterion / Acclaim, 2002-03-21, USA retail)
+ *   Title ID:    0x41430006
+ *   Base addr:   0x00010000
+ *   Entry point: 0x000160FF
+ *   Code size:   1,140,548 bytes (.text)
+ *   Sections:    11 (.text, D3D, D3DX, XGRPH, DSOUND, XPP, .rdata, .data,
+ *                DOLBY, $$XTIMAGE, $$XSIMAGE)
+ *   Kernel imports: 114, of which 30 are not currently bridged -- see
+ *                research/reports/xbe-toolchain-inventory.md for the list.
+ *                Import presence is not proof of execution; treat that as a
+ *                measured risk list to confirm dynamically, not a to-do.
+ *
+ * STATUS: this is the toolkit template with Burnout's identities filled in.
+ * It has not been run. Nothing below is evidence of runtime behaviour, and
+ * the Phase 0 subsystem reports are static analysis, not execution traces.
+ *
+ * NOTE (inherited from the template, true here too): WinMain, <windows.h> and
+ * the D3D11/XInput link libraries make this Windows-only. This machine is
+ * Linux; the build cross-compiles with mingw-w64 and runs under Wine, the
+ * same arrangement the Breakdown control uses.
+ */
+
+#include <windows.h>
+#include <tlhelp32.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+
+/* xboxrecomp runtime headers */
+#include <xbox/xboxrecomp.h>
+
+/* Device emulation. These libraries are linked in via the xboxrecomp umbrella
+ * target whether or not anything calls them; without the init below and the
+ * VEH routing further down, their apertures stay plain RAM and no fault ever
+ * reaches them. */
+#include "nv2a_mmio_hook.h"
+#include "apu_mmio_hook.h"
+#include "ac97_mmio_hook.h"
+#include "recomp_icall_feedback.h"
+
+/*
+ * If xboxrecomp.h is not an umbrella header in your setup, include
+ * the individual headers directly:
+ *
+ * #include "kernel.h"
+ * #include "xbox_memory_layout.h"
+ * #include "d3d8_xbox.h"
+ * #include "dsound_xbox.h"
+ * #include "xinput_xbox.h"
+ */
+
+/* ── Global register state (defined in xbox_memory_layout.c) ── */
+
+/* RECOMP_TLS is not optional here. The runtime defines these thread-local, and
+ * a plain `extern` referencing a __declspec(thread) variable does not resolve
+ * to the calling thread's copy -- it resolves to the image's TLS template. The
+ * host side then writes g_esp somewhere the generated code never reads, so the
+ * guest starts with every register at zero and faults immediately, having
+ * apparently ignored the setup that visibly ran. */
+extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
+extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi;
+extern RECOMP_TLS uint32_t g_seh_ebp;
+/* x87 and SSE state. Global for the same reason the volatile GPRs are: one
+ * guest routine can lift to several C functions, so a value written in one
+ * body is read in the next. Defined in xbox_memory_layout.c like the rest of
+ * the register file. */
+extern RECOMP_TLS double g_fp_stack[8];
+extern RECOMP_TLS int g_fp_top;
+extern RECOMP_TLS uint16_t g_fp_control_word;
+extern RECOMP_TLS int g_fp_cmp;
+extern RECOMP_TLS int g_df;
+extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
+extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
+extern RECOMP_TLS uint64_t g_mm0, g_mm1, g_mm2, g_mm3;
+extern RECOMP_TLS uint64_t g_mm4, g_mm5, g_mm6, g_mm7;
+extern ptrdiff_t g_xbox_mem_offset;
+
+/* ── XBE Constants ─────────────────────────────────────────── */
+
+/*
+ * These match config/source-manifest.json. The XBE lives where
+ * tools/extract-game-files.sh puts it, so a user who followed the documented
+ * setup needs no path editing.
+ */
+#define BURNOUT_ENTRY_POINT   0x000160FF   /* XBE entry point VA */
+#define BURNOUT_XBE_PATH      "game_files\\default.xbe"
+#define BURNOUT_DIR           "game_files"
+
+/* ── Forward declarations ──────────────────────────────────── */
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size);
+
+/* Recompiled entry point (generated by recomp pipeline) */
+extern void xbe_entry_point(void);
+
+/* ── Simulated CRTC ────────────────────────────────────────────
+ *
+ * Raise vertical blank at the NTSC rate.
+ *
+ * The kernel bridge already invokes registered ISRs at 60 Hz, but that alone
+ * tells the title a contradictory story: the ISR is called as though hardware
+ * had fired while the GPU registers still report nothing pending. A vblank ISR
+ * that checks PMC_INTR_EN_0 and then PMC_INTR_0 answers "not mine" every time,
+ * and its per-frame work never runs. This supplies the half that is missing.
+ *
+ * Ported from Breakdown, where the same gap produced the same shape of stall.
+ * Burnout arms two 60 Hz routines (0x001619A2 and 0x0015BC55) and its NV2A
+ * traffic sits on offset 0x000140 -- PMC -- which is what that ISR reads.
+ *
+ * The pending bit has to be STICKY: a title masks interrupts around its own
+ * critical sections by writing PMC_INTR_EN_0, so the bit is cleared by the ISR
+ * acknowledging it, not by us.
+ */
+extern void nv2a_raise_vblank(void);
+
+#define VBLANK_HZ 60
+
+static DWORD WINAPI vblank_thread(LPVOID unused)
+{
+    LARGE_INTEGER frequency, now;
+    LONGLONG next_tick, tick_remainder = 0;
+    unsigned delivered = 0;
+    LONGLONG report_start;
+
+    (void)unused;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&now);
+    next_tick = now.QuadPart;
+    report_start = now.QuadPart;
+
+    for (;;) {
+        nv2a_raise_vblank();
+        delivered++;
+
+        /* Keep the fractional 2/3 ms that Sleep(1000 / 60) discards. Video
+         * advances from vblank while the APU stream is independently paced at
+         * 48 kHz, so long-run clock drift shows up as deterministic A/V
+         * offset. */
+        next_tick += frequency.QuadPart / VBLANK_HZ;
+        tick_remainder += frequency.QuadPart % VBLANK_HZ;
+        if (tick_remainder >= VBLANK_HZ) {
+            next_tick++;
+            tick_remainder -= VBLANK_HZ;
+        }
+
+        for (;;) {
+            LONGLONG remaining;
+            QueryPerformanceCounter(&now);
+            remaining = next_tick - now.QuadPart;
+            if (remaining <= 0)
+                break;
+            {
+                DWORD ms = (DWORD)(remaining * 1000 / frequency.QuadPart);
+                if (ms > 1)
+                    Sleep(ms - 1);
+                else
+                    SwitchToThread();
+            }
+        }
+
+        if (now.QuadPart - report_start >= frequency.QuadPart * 5) {
+            fprintf(stderr, "[VBLANK] %u pulses in %.3f s (%.2f Hz)\n",
+                    delivered,
+                    (double)(now.QuadPart - report_start) / frequency.QuadPart,
+                    delivered * (double)frequency.QuadPart /
+                        (now.QuadPart - report_start));
+            fflush(stderr);
+            delivered = 0;
+            report_start = now.QuadPart;
+        }
+    }
+}
+
+static void start_vblank(void)
+{
+    HANDLE h = CreateThread(NULL, 0, vblank_thread, NULL, 0, NULL);
+    if (h) {
+        CloseHandle(h);
+        fprintf(stderr, "  NV2A: simulated CRTC raising vblank at %d Hz\n", VBLANK_HZ);
+    } else {
+        fprintf(stderr, "  NV2A: failed to start vblank thread\n");
+    }
+}
+
+/* ── Presentation bootstrap ────────────────────────────────────
+ *
+ * Creates a window and brings up the D3D8 layer's device, so that
+ * xbox_GetD3DDevice() returns something valid.
+ *
+ * WHY THIS LIVES HERE AND NOT IN THE TITLE'S PATH. On real hardware there is
+ * no window at all -- the console renders into a framebuffer that the CRTC
+ * scans out -- so a title never asks for one and never supplies an HWND. The
+ * D3D8 layer's d3d8_CreateDevice CONSUMES an HWND (pPP->hDeviceWindow, falling
+ * back to hFocusWindow) but nothing in the engine ever creates one: the only
+ * window creation anywhere is SDL_CreateWindow in d3d8_gl.c, which is the
+ * POSIX backend and is not compiled for this mingw build.
+ *
+ * Burnout, like Breakdown, runs the D3D8 statically linked into its own XBE
+ * rather than the HLE replacement, so it never calls d3d8_CreateDevice either.
+ * Bootstrapping the device here decouples "is there somewhere to draw" from
+ * "does this title use HLE or LLE D3D" -- nv2a_pgraph_d3d11.c already issues
+ * real DrawPrimitiveUP calls through xbox_GetD3DDevice(), and d3d8_device.c
+ * already owns a swap chain and d3d8_PresentFrame(). Both halves exist; this
+ * supplies the handle that connects them.
+ *
+ * The window is owned by a dedicated thread because Win32 delivers messages to
+ * the thread that created the window, and every other thread here is either a
+ * guest thread or blocked in a bridge. 640x480 matches the framebuffer this
+ * title allocates for itself: CONTIG #4 is 2,457,600 bytes, a double-buffered
+ * 640x480x32, with CONTIG #5 a single 1,228,800-byte buffer beside it.
+ *
+ * Failure is not fatal. Under Wine D3D11 device creation can fail outright;
+ * if it does we log and carry on headless, exactly as before.
+ */
+/* From xbox_nv2a. Declared here rather than included for the same reason as
+ * everything else in this file -- see the header note at the top. */
+extern void pgraph_d3d11_init(void);
+
+#define PRESENT_W 640
+#define PRESENT_H 480
+
+static volatile LONG g_present_state;   /* 0 = pending, 1 = up, -1 = failed */
+
+/* Set when this runs as burnout_game.dll inside the Windows launcher: the
+ * launcher owns the window (it drew the menu there), so the presentation
+ * thread adopts it instead of creating its own. One window, start to finish.
+ * The launcher's thread keeps pumping its messages; present_wndproc is
+ * chained in front of the launcher's procedure. NULL in the standalone exe. */
+static HWND g_host_hwnd;
+static WNDPROC g_host_prev_proc;
+
+static LRESULT CALLBACK present_wndproc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    /* Close the window, end the process. The title owns process lifetime and
+     * there is no teardown path a window close could safely run -- guest
+     * threads are mid-frame on simulated stacks and nothing can unwind them --
+     * so this does not try to unwind: it flushes the logs everything here
+     * writes to and exits. */
+    if (msg == WM_CLOSE) {
+        fprintf(stderr, "[PRESENT] window closed; exiting\n");
+        fflush(stderr);
+        fflush(stdout);
+        ExitProcess(0);
+    }
+
+    /* Hosted, the launcher keeps the window at 4:3 itself (a child centred in
+     * a black frame), so everything else is the launcher's to handle. */
+    if (g_host_prev_proc)
+        return CallWindowProcW(g_host_prev_proc, h, msg, wp, lp);
+
+    /* The swap chain is a fixed PRESENT_W x PRESENT_H buffer that DXGI
+     * stretches over the whole client area, so the picture takes whatever
+     * shape the window has. Keep the client area at the guest's aspect
+     * instead. WM_SIZING covers drag-resizing where the driver reports it;
+     * Wine's X11 driver lets the window manager resize without sending it,
+     * so WM_SIZE corrects the shape after the fact as well. */
+    if (msg == WM_SIZING) {
+        RECT *drag = (RECT *)lp;
+        RECT frame = { 0, 0, 0, 0 };
+        LONG fw, fh, cw, ch;
+        AdjustWindowRect(&frame, WS_OVERLAPPEDWINDOW, FALSE);
+        fw = frame.right - frame.left;
+        fh = frame.bottom - frame.top;
+        cw = drag->right - drag->left - fw;
+        ch = drag->bottom - drag->top - fh;
+        if (wp == WMSZ_TOP || wp == WMSZ_BOTTOM)
+            cw = ch * PRESENT_W / PRESENT_H;
+        else
+            ch = cw * PRESENT_H / PRESENT_W;
+        if (wp == WMSZ_TOP || wp == WMSZ_TOPLEFT || wp == WMSZ_TOPRIGHT)
+            drag->top = drag->bottom - ch - fh;
+        else
+            drag->bottom = drag->top + ch + fh;
+        if (wp == WMSZ_LEFT || wp == WMSZ_TOPLEFT || wp == WMSZ_BOTTOMLEFT)
+            drag->left = drag->right - cw - fw;
+        else
+            drag->right = drag->left + cw + fw;
+        return TRUE;
+    }
+    if (msg == WM_SIZE && wp == SIZE_RESTORED) {
+        LONG cw = LOWORD(lp), ch = HIWORD(lp);
+        LONG want = cw * PRESENT_H / PRESENT_W;
+        if (cw > 0 && ch > 0 && (want - ch > 1 || ch - want > 1)) {
+            RECT wr = { 0, 0, cw, want };
+            AdjustWindowRect(&wr, WS_OVERLAPPEDWINDOW, FALSE);
+            SetWindowPos(h, NULL, 0, 0, wr.right - wr.left, wr.bottom - wr.top,
+                         SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+    }
+    return DefWindowProcA(h, msg, wp, lp);
+}
+
+static DWORD WINAPI present_thread(LPVOID unused)
+{
+    WNDCLASSA wc;
+    HWND hwnd;
+    IDirect3D8 *d3d;
+    IDirect3DDevice8 *dev = NULL;
+    D3DPRESENT_PARAMETERS pp;
+    RECT r;
+    HRESULT hr;
+    MSG msg;
+
+    (void)unused;
+
+    if (g_host_hwnd) {
+        hwnd = g_host_hwnd;
+        g_host_prev_proc = (WNDPROC)SetWindowLongPtrW(hwnd, GWLP_WNDPROC,
+                                                     (LONG_PTR)present_wndproc);
+        goto have_window;
+    }
+
+    memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc   = present_wndproc;
+    wc.hInstance     = GetModuleHandleA(NULL);
+    wc.hCursor       = LoadCursorA(NULL, (LPCSTR)IDC_ARROW);
+    wc.lpszClassName = "BurnoutRecomp";
+    if (!RegisterClassA(&wc)) {
+        fprintf(stderr, "  [PRESENT] RegisterClass failed (%lu)\n", GetLastError());
+        InterlockedExchange(&g_present_state, -1);
+        return 0;
+    }
+
+    /* Size the frame so the CLIENT area is exactly the guest's framebuffer. */
+    r.left = 0; r.top = 0; r.right = PRESENT_W; r.bottom = PRESENT_H;
+    AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+
+    hwnd = CreateWindowExA(0, wc.lpszClassName, "Burnout (recompiled)",
+                           WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT,
+                           r.right - r.left, r.bottom - r.top,
+                           NULL, NULL, wc.hInstance, NULL);
+    if (!hwnd) {
+        fprintf(stderr, "  [PRESENT] CreateWindowEx failed (%lu)\n", GetLastError());
+        InterlockedExchange(&g_present_state, -1);
+        return 0;
+    }
+    ShowWindow(hwnd, SW_SHOW);
+    UpdateWindow(hwnd);
+
+have_window:
+    d3d = xbox_Direct3DCreate8(0);
+    if (!d3d) {
+        fprintf(stderr, "  [PRESENT] Direct3DCreate8 returned NULL\n");
+        InterlockedExchange(&g_present_state, -1);
+        return 0;
+    }
+
+    memset(&pp, 0, sizeof(pp));
+    pp.BackBufferWidth  = PRESENT_W;
+    pp.BackBufferHeight = PRESENT_H;
+    pp.BackBufferCount  = 1;
+    pp.hDeviceWindow    = hwnd;
+    pp.Windowed         = TRUE;
+
+    hr = d3d->lpVtbl->CreateDevice(d3d, 0, 0, hwnd, 0, &pp, &dev);
+    if (FAILED(hr) || !xbox_GetD3DDevice()) {
+        fprintf(stderr, "  [PRESENT] CreateDevice failed (0x%08lX) -- "
+                "continuing headless\n", (unsigned long)hr);
+        InterlockedExchange(&g_present_state, -1);
+        return 0;
+    }
+
+    fprintf(stderr, "  [PRESENT] window %dx%d up, D3D8 device ready "
+            "(xbox_GetD3DDevice=%p)\n", PRESENT_W, PRESENT_H,
+            (void *)xbox_GetD3DDevice());
+    fflush(stderr);
+
+    /* Arm the PGRAPH->D3D11 translator now that there is a device for it to
+     * draw with. Until this runs, pgraph_d3d11_method() returns "not handled"
+     * for every method and the whole push buffer reads as unhandled traffic.
+     * Only nv2a_pb_replay.c ever called this, so arming it was tied to
+     * replaying a captured frame rather than running the title's own. */
+    pgraph_d3d11_init();
+
+    InterlockedExchange(&g_present_state, 1);
+
+    /* A hosted window's messages arrive on the launcher's thread, which
+     * already runs a loop for them. */
+    if (g_host_hwnd)
+        return 0;
+
+    /* Own this window's message loop for the life of the process. */
+    while (GetMessageA(&msg, NULL, 0, 0) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return 0;
+}
+
+static void start_presentation(void)
+{
+    HANDLE h = CreateThread(NULL, 0, present_thread, NULL, 0, NULL);
+    if (!h) {
+        fprintf(stderr, "  [PRESENT] failed to start presentation thread\n");
+        return;
+    }
+    CloseHandle(h);
+
+    /* Wait briefly so the device is up before guest code can draw, and so the
+     * log reads in a sensible order. Not load-bearing -- pgraph null-checks
+     * xbox_GetD3DDevice() on every draw. */
+    {
+        int waited = 0;
+        while (!InterlockedCompareExchange(&g_present_state, 0, 0) && waited < 3000) {
+            Sleep(10);
+            waited += 10;
+        }
+    }
+}
+
+/* ── Indirect-branch feedback dump ──────────────────────────── */
+
+/*
+ * recomp_icall_feedback_init() registers an atexit dump, which covers a clean
+ * exit and the crash handler. Burnout does neither: it boots and keeps
+ * running, so a `timeout` kill would take the observations with it. The
+ * feedback header is explicit that a title in that shape has to dump for
+ * itself, and deliberately provides no timer thread of its own.
+ *
+ * XBOXRECOMP_ICALL_DUMP_AFTER=<seconds> is that timer. It dumps once and lets
+ * the title carry on, so one run yields a usable target set. The macro compiles
+ * away when the feature is off, so this needs no #ifdef.
+ */
+static DWORD WINAPI icall_dump_thread(LPVOID seconds)
+{
+    Sleep((DWORD)(uintptr_t)seconds * 1000);
+    fprintf(stderr, "[icall-feedback] timed dump after %lu s\n",
+            (unsigned long)(uintptr_t)seconds);
+    RECOMP_ICALL_FEEDBACK_DUMP();
+    return 0;
+}
+
+static void start_icall_dump_timer(void)
+{
+    const char *s = getenv("XBOXRECOMP_ICALL_DUMP_AFTER");
+    HANDLE h;
+    if (!s || !*s)
+        return;
+    h = CreateThread(NULL, 0, icall_dump_thread,
+                     (LPVOID)(uintptr_t)strtoul(s, NULL, 10), 0, NULL);
+    if (h) CloseHandle(h);
+    else fprintf(stderr, "[icall-feedback] failed to start dump timer\n");
+}
+
+/* ── Stall probe ───────────────────────────────────────────── */
+
+/*
+ * "Where is the title busy-waiting?" -- ported from Breakdown's main.c.
+ *
+ * Gated by XBOXRECOMP_STALL_PROBE so it costs nothing when off. It exists
+ * because gdb cannot answer this question here: any diagnostic that works by
+ * faulting (the AC97 RR guard, for one) is intercepted by gdb before the VEH
+ * sees it, and passing SIGSEGV through kills wine on the single-step. A probe
+ * inside the process has no such conflict and works either way.
+ *
+ * Contexts are captured under suspension but printed after resuming: holding
+ * a thread suspended while calling fprintf can deadlock on the stdio lock the
+ * suspended thread might own.
+ */
+
+/* Per-thread "which guest function is this thread in".
+ *
+ * The durable half of a guest-location trace; the per-site stores live in
+ * src/recomp/gen/*.c and are wiped by every regen, which is fine -- they are
+ * re-added by debug-instruments/instrument_guestloc.py.
+ *
+ * Per-thread slots are the whole point. One global is useless: interrupt
+ * delivery runs a guest ISR 60 times a second per thread, so a global only
+ * ever holds ISR code no matter what the thread of interest is doing.
+ */
+#define FN_TRACE_SLOTS 64
+
+volatile uint32_t g_fn_trace[FN_TRACE_SLOTS];
+volatile uint32_t g_fn_tid[FN_TRACE_SLOTS];
+static volatile LONG g_fn_next_slot;
+RECOMP_TLS int g_fn_slot = -1;
+
+/* Claim this thread's slot. Called once per thread, from generated code. */
+int recomp_trace_slot(void)
+{
+    LONG s = InterlockedIncrement(&g_fn_next_slot) - 1;
+    if (s < 0 || s >= FN_TRACE_SLOTS)
+        s = FN_TRACE_SLOTS - 1;     /* overflow shares the last slot */
+    g_fn_tid[s] = (uint32_t)GetCurrentThreadId();
+    return (int)s;
+}
+
+#define STALL_PROBE_MAX_THREADS 32
+
+static DWORD WINAPI stall_probe_thread(LPVOID unused)
+{
+    (void)unused;
+    Sleep(10000);  /* let the title get as far as it is going to get */
+
+    for (;;) {
+        DWORD64 rip[STALL_PROBE_MAX_THREADS], rsp[STALL_PROBE_MAX_THREADS];
+        DWORD   tid[STALL_PROBE_MAX_THREADS];
+        int n = 0;
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+
+        if (snap != INVALID_HANDLE_VALUE) {
+            THREADENTRY32 te;
+            BOOL ok;
+            te.dwSize = sizeof(te);
+            for (ok = Thread32First(snap, &te);
+                 ok && n < STALL_PROBE_MAX_THREADS;
+                 ok = Thread32Next(snap, &te)) {
+                HANDLE th;
+                CONTEXT ctx;
+
+                if (te.th32OwnerProcessID != GetCurrentProcessId()) continue;
+                if (te.th32ThreadID == GetCurrentThreadId()) continue;
+
+                th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT,
+                                FALSE, te.th32ThreadID);
+                if (!th) continue;
+
+                memset(&ctx, 0, sizeof(ctx));
+                ctx.ContextFlags = CONTEXT_CONTROL;
+                if (SuspendThread(th) != (DWORD)-1) {
+                    if (GetThreadContext(th, &ctx)) {
+                        tid[n] = te.th32ThreadID;
+                        rip[n] = ctx.Rip;
+                        rsp[n] = ctx.Rsp;
+                        n++;
+                    }
+                    ResumeThread(th);
+                }
+                CloseHandle(th);
+            }
+            CloseHandle(snap);
+        }
+
+        /* Under Wine every suspended thread reports the same ntdll RIP (the
+         * syscall boundary), so the instruction pointer alone says nothing.
+         * The recompiled call chain is still on the stack though -- scan it
+         * for addresses inside this image the way the VEH handler does, and
+         * read through ReadProcessMemory so an unmapped page returns FALSE
+         * instead of faulting the probe. */
+        for (int i = 0; i < n; i++) {
+            DWORD64 frame[512];
+            SIZE_T got = 0;
+            int printed = 0;
+
+            fprintf(stderr, "[STALL] tid %-6lu RIP=0x%llX RSP=0x%llX\n",
+                    (unsigned long)tid[i],
+                    (unsigned long long)rip[i], (unsigned long long)rsp[i]);
+
+            if (ReadProcessMemory(GetCurrentProcess(), (LPCVOID)(uintptr_t)rsp[i],
+                                  frame, sizeof(frame), &got) && got) {
+                size_t words = got / sizeof(DWORD64);
+                for (size_t w = 0; w < words && printed < 8; w++) {
+                    if (frame[w] >= 0x140000000ULL && frame[w] < 0x150000000ULL) {
+                        fprintf(stderr, "          ret[%zu] 0x%llX\n",
+                                w, (unsigned long long)frame[w]);
+                        printed++;
+                    }
+                }
+            }
+            if (!printed)
+                fprintf(stderr, "          (no recomp return addresses on stack)\n");
+        }
+        fprintf(stderr, "[STALL] --- %d thread(s) sampled ---\n", n);
+
+        /* Where is each thread in GUEST code? This is the part that actually
+         * answers "what stopped", because the native RIP under Wine is always
+         * the ntdll syscall boundary and guest code runs on a simulated
+         * stack, so neither of the above names a guest location.
+         *
+         * Silent unless debug-instruments/instrument_guestloc.py has been run
+         * against the current src/recomp/gen. */
+        {
+            int s;
+            for (s = 0; s < FN_TRACE_SLOTS; s++) {
+                if (g_fn_tid[s])
+                    fprintf(stderr, "[GUESTLOC] tid %-6lu in sub_%08X\n",
+                            (unsigned long)g_fn_tid[s], g_fn_trace[s]);
+            }
+        }
+        fflush(stderr);
+
+        Sleep(5000);
+    }
+}
+
+static void start_stall_probe(void)
+{
+    HANDLE h = CreateThread(NULL, 0, stall_probe_thread, NULL, 0, NULL);
+    if (h) CloseHandle(h);
+    else fprintf(stderr, "[STALL] failed to start stall probe\n");
+}
+
+/* ── VEH crash handler ─────────────────────────────────────── */
+
+/*
+ * Vectored Exception Handler for crash diagnostics.
+ *
+ * When the recompiled game hits an access violation, this handler prints
+ * the faulting address, all Xbox register values, and a native stack trace.
+ * This is your primary debugging tool during bring-up.
+ *
+ * Customize this for your game:
+ *   - Add game-specific address checks (GPU register probes, etc.)
+ *   - Add dumps of game-specific globals (heap handles, state flags)
+ *   - Add SEH simulation if your game uses __try/__except
+ */
+static LONG CALLBACK veh_handler(PEXCEPTION_POINTERS ep)
+{
+    /* A guarded AC97 store is completed by stepping over it, so the step
+     * lands back here. Claimed only by the thread that set the trap flag. */
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) {
+        if (ac97_hook_handle_fault(ep->ContextRecord, 0, 1, 1))
+            return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    if (ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        uintptr_t fault_addr = ep->ExceptionRecord->ExceptionInformation[1];
+
+        /* The template abandoned faults in 0xFD000000-0xFE000000 here, testing
+         * the HOST address against a GUEST range. That was harmless only while
+         * nothing emulated the NV2A. It is actively wrong now: the two ranges
+         * overlap, because g_xbox_mem_offset is only 0x10000, so this swallowed
+         * exactly the register accesses the routing below exists to service and
+         * turned them into unhandled page faults. Removed; the aperture check
+         * below does it properly, on the converted guest address. */
+
+        /*
+         * Device register access, routed to the emulated hardware.
+         *
+         * fault_addr is a HOST address; the register models index by guest VA
+         * and the two differ by g_xbox_mem_offset, so convert before
+         * comparing. A decode failure is deliberately NOT swallowed -- resuming
+         * would re-execute the same faulting instruction forever -- so it falls
+         * through to the crash report below, which names the instruction.
+         */
+        {
+            uint32_t fault_va = (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset);
+            int is_write = (ep->ExceptionRecord->ExceptionInformation[0] == 1);
+
+            if (fault_va >= 0xFD000000u && fault_va < 0xFE000000u) {
+                if (nv2a_hook_handle_mmio(ep->ContextRecord, fault_addr,
+                                          fault_va, is_write))
+                    return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            /* Only the MODELLED part of the MCPX aperture traps. AC97
+             * (+0x400000), USB and NIC stay plain RAM and must never have a
+             * fault manufactured for them. */
+            /* AC97 control registers: guarded so a store cannot persist the
+             * self-clearing RR bit. Not a register model -- the rest of the
+             * block stays plain RAM. */
+            if (fault_va >= 0xFEC00000u && fault_va < 0xFED00000u) {
+                if (ac97_hook_handle_fault(ep->ContextRecord, fault_va,
+                                           is_write, 0))
+                    return EXCEPTION_CONTINUE_EXECUTION;
+            }
+
+            if (fault_va >= APU_MMIO_BASE &&
+                fault_va < APU_MMIO_BASE + APU_MMIO_SIZE) {
+                if (apu_hook_handle_mmio(ep->ContextRecord, fault_addr,
+                                         fault_va, is_write))
+                    return EXCEPTION_CONTINUE_EXECUTION;
+            }
+        }
+
+        fprintf(stderr, "[CRASH] Access violation at RIP=0x%llX, fault addr=0x%llX (%s)\n",
+            (unsigned long long)ep->ContextRecord->Rip,
+            (unsigned long long)fault_addr,
+            ep->ExceptionRecord->ExceptionInformation[0] ? "write" : "read");
+        fprintf(stderr, "  Xbox regs: eax=0x%08X ecx=0x%08X edx=0x%08X esp=0x%08X\n",
+            g_eax, g_ecx, g_edx, g_esp);
+        fprintf(stderr, "  Xbox regs: ebx=0x%08X esi=0x%08X edi=0x%08X\n",
+            g_ebx, g_esi, g_edi);
+        fprintf(stderr, "  Xbox VA of fault: 0x%08X\n",
+            (uint32_t)(fault_addr - (uintptr_t)g_xbox_mem_offset));
+
+        /*
+         * TODO: Add game-specific diagnostics here. Examples:
+         *
+         * Dump CRT heap handle:
+         *   uint32_t heap = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + HEAP_HANDLE_VA);
+         *   fprintf(stderr, "  CRT heap handle: 0x%08X\n", heap);
+         *
+         * Dump game state:
+         *   uint32_t state = *(uint32_t *)((uint8_t *)g_xbox_mem_offset + GAME_STATE_VA);
+         *   fprintf(stderr, "  Game state: %u\n", state);
+         */
+
+        /* Print native stack return addresses for debugging */
+        {
+            uintptr_t *sp = (uintptr_t *)ep->ContextRecord->Rsp;
+            fprintf(stderr, "  Native stack (first 8 return addrs):\n");
+            for (int i = 0; i < 64 && sp[i]; i++) {
+                if (sp[i] >= 0x140000000ULL && sp[i] < 0x150000000ULL) {
+                    fprintf(stderr, "    [%d] 0x%llX\n", i, (unsigned long long)sp[i]);
+                }
+            }
+        }
+        fflush(stderr);
+    }
+
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* ── Start-up ──────────────────────────────────────────────── */
+
+/* Start-up is two halves so the Windows launcher can host the game:
+ *
+ *   game_prepare  install the fault handler, load the XBE and claim the Xbox
+ *                 address space
+ *   game_run      the kernel, the devices, the window and the title itself
+ *
+ * The launcher calls game_prepare BEFORE it creates its own D3D11 device for
+ * the menu. A graphics driver reserves address space as it starts, and the
+ * memory layout wants the low 4 GB windows the Xbox used (the RAM base and
+ * mirrors, the NV2A/MCPX apertures, the kernel page); claimed first, it gets
+ * them exactly as the standalone exe does.
+ *
+ * Breakdown's split also moves the NV2A and APU traps into prepare. Here only
+ * the address-space claim moves: everything else keeps the order this title
+ * was brought up and tested in. */
+
+static void *g_xbe_data;
+
+static int game_prepare(void)
+{
+    void *xbe_data = NULL;
+    size_t xbe_size = 0;
+
+    /* Install VEH handler (first handler in chain) */
+    AddVectoredExceptionHandler(1, veh_handler);
+
+    RECOMP_ICALL_FEEDBACK_INIT();
+    start_icall_dump_timer();
+
+    /* Step 1: Load XBE */
+    if (!load_xbe(BURNOUT_XBE_PATH, &xbe_data, &xbe_size)) {
+        MessageBoxA(NULL, "Failed to load default.xbe.\n"
+                    "Run tools/extract-game-files.sh to produce game_files/ "
+                    "from your own Burnout disc image.",
+                    "Recomp", MB_ICONERROR);
+        return 1;
+    }
+    g_xbe_data = xbe_data;
+    printf("XBE loaded: %zu bytes\n", xbe_size);
+
+    /* Step 2: Initialize Xbox memory layout */
+    printf("Initializing Xbox memory layout...\n");
+    if (!xbox_MemoryLayoutInit(xbe_data, xbe_size)) {
+        MessageBoxA(NULL, "Failed to initialize Xbox memory layout.\n"
+                    "The required virtual address range may be unavailable.",
+                    "Recomp", MB_ICONERROR);
+        free(xbe_data);
+        g_xbe_data = NULL;
+        return 1;
+    }
+
+    g_xbox_mem_offset = xbox_GetMemoryOffset();
+    printf("Xbox memory mapped. Offset: 0x%llX\n", (unsigned long long)g_xbox_mem_offset);
+    return 0;
+}
+
+static void game_run(void)
+{
+    /* Step 3: Initialize Xbox kernel */
+    printf("Initializing Xbox kernel replacement...\n");
+    xbox_kernel_init();
+
+    /* Step 4: Set game directory for file I/O path translation */
+    {
+        extern void xbox_path_init(const char *game_dir, const char *save_dir);
+        xbox_path_init(BURNOUT_DIR, NULL);
+    }
+
+    /* Step 5: Initialize kernel bridge (thunk table in Xbox memory) */
+    printf("Initializing kernel bridge...\n");
+    xbox_kernel_bridge_init();
+
+    /* Step 5b: device emulation.
+     *
+     * Order matters in both cases: enable trapping FIRST, then init, so the
+     * VEH can service the very first access. Until this runs, both apertures
+     * are plain zeroed RAM -- reads return 0 and writes stick, which is
+     * survivable for capability probes but hangs anything that writes a
+     * command and waits for the device to answer. */
+    printf("Initializing NV2A GPU emulation...\n");
+    if (xbox_Nv2aEnableTrapping())
+        nv2a_hook_init(g_xbox_mem_offset);
+
+    /* mcpx_apu_init_standalone() wants the host address of guest PHYSICAL
+     * address 0; XBOX_MAP_START is 0, so that is exactly g_xbox_mem_offset.
+     * It also starts a frame thread and opens an audio device. */
+    printf("Initializing MCPX APU emulation...\n");
+    /* The AC97 block stays plain RAM (the APU model deliberately does not
+     * cover it), which is fine except that DSOUND's reset waits on the
+     * self-clearing RR bit and reads it back only once. Opt in so the bit
+     * cannot stick; without this the boot thread spins in sub_00161614
+     * forever. Enable before trapping starts, so the very first store is
+     * already guarded. */
+    ac97_hook_enable();
+
+    if (xbox_ApuEnableTrapping())
+        g_apu_state = mcpx_apu_init_standalone((uint8_t *)(uintptr_t)g_xbox_mem_offset);
+
+    /* Step 5c: somewhere to draw. See start_presentation() for why the
+     * harness creates the window rather than the title. */
+    printf("Bringing up window and D3D8 device...\n");
+    start_presentation();
+
+    /* Step 5d: give the GPU registers a story that matches the 60 Hz ISR the
+     * kernel bridge already delivers. See start_vblank(). */
+    start_vblank();
+
+    /* Step 6: Initialize stack */
+    g_esp = XBOX_STACK_TOP;
+
+    /*
+     * TODO: Pre-initialize CRT globals if needed.
+     *
+     * Many Xbox games use the MSVC CRT. The CRT's __heap_init sets up a
+     * heap descriptor at a game-specific address. You may need to
+     * pre-initialize __active_heap to avoid small-block heap issues:
+     *
+     *   uint32_t *active_heap = (uint32_t *)((uint8_t *)g_xbox_mem_offset + ACTIVE_HEAP_VA);
+     *   *active_heap = 1;  // 1 = system heap (HeapAlloc), avoids SBH init
+     *
+     * Find ACTIVE_HEAP_VA by searching the disassembly for __heap_init
+     * or by looking for the CRT's __active_heap global in the data section.
+     */
+
+    printf("\n=== Initialization complete ===\n");
+    printf("Entry point: 0x%08X\n", BURNOUT_ENTRY_POINT);
+    printf("ESP: 0x%08X\n", g_esp);
+
+    /* Step 7: Call the recompiled entry point */
+    printf("\nStarting game...\n");
+    fflush(stdout);
+
+    /* The stall probe suspends every process thread to inspect its stack,
+     * so it is for deliberate hang investigation only, not normal runs. */
+    if (getenv("XBOXRECOMP_STALL_PROBE"))
+        start_stall_probe();
+
+    xbe_entry_point();
+
+    printf("\nGame returned. Cleaning up...\n");
+
+    /* Cleanup */
+    xbox_kernel_shutdown();
+    xbox_MemoryLayoutShutdown();
+    free(g_xbe_data);
+    g_xbe_data = NULL;
+}
+
+#ifdef BURNOUT_DLL
+
+/* ── burnout_game.dll exports (the Windows launcher) ──────────── */
+
+/* Bumped whenever these signatures or their contract change; the launcher
+ * refuses a DLL that reports a different number and rebuilds it. */
+#define BURNOUT_GAME_API 1
+
+__declspec(dllexport) int burnout_game_api(void)
+{
+    return BURNOUT_GAME_API;
+}
+
+/* game_root holds game_files\ (relative paths resolve against it, as they do
+ * from the exe's working directory). Everything the runtime prints goes to
+ * log_path: a GUI process has no console to print to. 0 on success. */
+__declspec(dllexport) int burnout_game_prepare(const wchar_t *game_root,
+                                               const wchar_t *log_path)
+{
+    if (log_path && *log_path) {
+        _wfreopen(log_path, L"w", stderr);
+        _wfreopen(log_path, L"a", stdout);
+    }
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+    if (game_root && *game_root && !SetCurrentDirectoryW(game_root)) {
+        fprintf(stderr, "[HOST] cannot enter the game directory (%lu)\n",
+                GetLastError());
+        return 1;
+    }
+    printf("=== Burnout - Static Recompilation (hosted) ===\n");
+    printf("Loading XBE...\n");
+    return game_prepare();
+}
+
+/* Runs the title in the launcher's window. Call it on a thread of its own
+ * (the launcher's thread must keep pumping the window's messages). Closing
+ * the window ends the process, as it does for the exe; so does the title
+ * returning, since the launcher has nothing to go back to. */
+__declspec(dllexport) void burnout_game_run(HWND hwnd)
+{
+    /* The fake TIB behind every fs: access is thread-local, and
+     * xbox_MemoryLayoutInit() filled it in on the thread that called
+     * burnout_game_prepare: the launcher's. This is a thread of its own, so
+     * its copy is still zeroed, and the title's SetLastError (sub_0001479D)
+     * walked fs:[4] = 0 as its TLS array and faulted at Xbox VA 0xFFFFFFEC
+     * the first time an XGetSectionHandle lookup missed (HeroGame,
+     * 2026-10-13). */
+    xbox_init_fake_tib();
+    g_host_hwnd = hwnd;
+    game_run();
+    fflush(stderr);
+    fflush(stdout);
+    ExitProcess(0);
+}
+
+#else
+
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance,
+                   LPSTR lpCmdLine, int nCmdShow)
+{
+    (void)hInstance;
+    (void)hPrevInstance;
+    (void)lpCmdLine;
+    (void)nCmdShow;
+
+    /* Unbuffered output for immediate visibility during debugging */
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    printf("=== Burnout - Static Recompilation ===\n");
+    printf("Loading XBE...\n");
+
+    if (game_prepare() != 0)
+        return 1;
+    game_run();
+    return 0;
+}
+
+#endif /* BURNOUT_DLL */
+
+/* ── XBE Loading ───────────────────────────────────────────── */
+
+static BOOL load_xbe(const char *path, void **out_data, size_t *out_size)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "Cannot open XBE: %s\n", path);
+        return FALSE;
+    }
+
+    fseek(f, 0, SEEK_END);
+    long size = ftell(f);
+    fseek(f, 0, SEEK_SET);
+
+    if (size <= 0) {
+        fclose(f);
+        return FALSE;
+    }
+
+    void *data = malloc((size_t)size);
+    if (!data) {
+        fclose(f);
+        return FALSE;
+    }
+
+    if (fread(data, 1, (size_t)size, f) != (size_t)size) {
+        free(data);
+        fclose(f);
+        return FALSE;
+    }
+
+    fclose(f);
+    *out_data = data;
+    *out_size = (size_t)size;
+    return TRUE;
+}
+
+#ifndef BURNOUT_DLL
+/* Console entry point (for debugging -- lets you see printf output) */
+int main(int argc, char **argv)
+{
+    (void)argc;
+    (void)argv;
+    return WinMain(GetModuleHandle(NULL), NULL, GetCommandLineA(), SW_SHOW);
+}
+#endif
